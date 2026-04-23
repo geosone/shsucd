@@ -1,4 +1,23 @@
+;****************************************************************************
+; SHSUCDHD Version 4.00
+; Shirish (IonfraX / PCGamingTimeMachine), 2026
+; ionfrax@protonmail.com / ionfrax@gmail.com
 ;
+; To keep this section concise, I've detailed changes since
+; version 3.01 and what's special about this version, detailed
+; instructions in REDBOOK.TXT
+;
+; !!! DISCLAIMER !!!
+; AI help was used for bootstrap code for some functionalities,
+; debugging and code cleanup/formatting. However I did manually
+; verify everything and manually built on top of initial bootstrap
+; code blocks if AI was used. I severely despise AI slop but
+; acknowledge that used correctly it's a useful tool (especially
+; debugging).
+; If you find any issues or unoptimized code/logic in CD audio or
+; XMS related code, please let me know.
+;
+;*** Prev version comments:
 ;****************************************************************************
 ;
 ; SHSUCDHD Version 3.00
@@ -30,18 +49,17 @@
 ;
 ;****************************************************************************
 ;
-
+ 
 ;%define i8086		; If defined no 386 instructions will be used.
-
-
+ 
 %include "nasm.mac"
-
+ 
 %ifdef i8086
 	cpu	8086
 %else
 	cpu	386
 %endif
-
+ 
 struc rh
   .Length		resb	1	; header size in bytes
   .Unit 		resb	1	; CD drive unit
@@ -49,7 +67,7 @@ struc rh
   .Status		resw	1	; device command status
   .Reserved		resb	8
 endstruc
-
+ 
 struc rhIOCTL
 			resb	rh_size ; RH common
   .MediaDesc		resb	1
@@ -58,7 +76,7 @@ struc rhIOCTL
   .StartSector		resw	1
   .VolIdPtr		resd	1
 endstruc
-
+ 
 struc rhTransfer
 			resb	rh_size ; RH common
 			resb	1
@@ -69,12 +87,12 @@ struc rhTransfer
 			resb	1
 			resb	1
 endstruc
-
+ 
 rhcmdIOCTL_In		equ	03h
 rhcmdOpen		equ	0Dh
 rhcmdClose		equ	0Eh
 rhcmdReadLong		equ	80h
-
+ 
 IOCtl_In_RDHACmd	equ	 0
 IOCtl_ReadDriveBytes	equ	 5
 IOCtl_DevStatCmd	equ	 6
@@ -83,12 +101,13 @@ IOCtl_ReturnVolumeSize	equ	 8	; total sectors on disk
 IOCtl_MediaChangedCmd	equ	 9
 IOCtl_AudioDiskInfo	equ	10
 IOCtl_AudioTrackInfo	equ	11
+IOCtl_AudioQChannelInfo equ 12
 IOCtl_AudioStatusInfo	equ	15
-
+ 
 MediaChanged_No 	equ	 1
 MediaChanged_Yes	equ	-1
 MediaChanged_DontKnow	equ	 0
-
+ 
 DeviceError		equ	8000h
 DeviceDone		equ	0100h
 DE_UnknownUnit		equ	  01h	; OR these with DeviceError
@@ -96,27 +115,51 @@ DE_DeviceNotReady	equ	  02h
 DE_UnknownCommand	equ	  03h
 DE_SectorNotFound	equ	  08h
 DE_ReadError		equ	  0Bh
+ 
 
-DriveNormalReady	equ	0
-; Door closed, door locked, supports only cooked reading, read only,
-; data read only, no interleaving, (reserved), no prefetching,
-; no audio channel manipulation, supports HSG addressing mode (not Red Book).
-
-
+DriveNormalReady	equ	0216h
+; Matches UIDE's device status (00216h):
+; Bit 1 (0002h): door locked
+; Bit 2 (0004h): supports cooked AND raw reading
+; Bit 4 (0010h): supports audio play (Red Book audio)
+; Bit 9 (0200h): supports Red Book addressing (HSG + Red Book)
+ 
 SectorSize		equ	2048	; make it an EQU so we don't change it
 SectorShift		equ	11
-
-
+ 
 struc DriveEntry
-  .VolSize		resd	1	; this order is assumed
-  .LeadOut		resd	1
-  .Handle		resw	1
+  .VolSize		resd	1	; total sectors (= lead_out_lba for BIN/CUE)
+  .LeadOut		resd	1	; lead-out Red Book (precomputed for BIN/CUE)
+  .BinHandle		resw	1	; DOS file handle for image
+  .NumTracks		resb	1	; number of tracks (0 for ISO)
+  .FirstTrack		resb	1	; first track number (0 for ISO)
+  .LastTrack		resb	1	; last track number (0 for ISO)
+  .ImageType		resb	1	; 0=ISO, 1=BIN/CUE
+  .BinSectSize		resw	1	; raw sector size in BIN (e.g. 2352; 0 for ISO)
+  .TrackTableOfs	resw	1	; offset to TrackEntry array (0 for ISO)
+  .DataStartLBA		resd	1	; first LBA of data track (0 for ISO)
+  .DataEndLBA		resd	1	; first LBA past data track (0 for ISO)
+  .DataOffset		resw	1	; user data offset in raw sector (0 for ISO)
 endstruc
-
-
+ 
+struc TrackEntry
+  .TrackNum		resb	1	; 1-based
+  .Type			resb	1	; 0=data, 1=audio
+  .SectorSize		resw	1	; raw sector size in BIN
+  .DataOffset		resw	1	; offset of user data in raw sector
+  .UserDataSize		resw	1	; cooked data size (2048 or 2352)
+  .StartLBA		resd	1	; sector index in BIN
+  .Length		resd	1	; length in sectors
+  .StartRedBook		resd	1	; precomputed Red Book (frame, sec, min, 0)
+endstruc
+ 
+%if TrackEntry_size != 20
+%error "TrackEntry must be 20 bytes to match .cdm file format"
+%endif
+ 
 ; DOS device header with CDROM extension fields
 ; DO NOT MAKE THE DEVICE DRIVER NAME THE SAME AS THE FILE NAME
-
+ 
 CDHDHdr
   NextDriver	dd	-1
 		dw	0C800h		; attributes for a CDROM
@@ -126,16 +169,24 @@ CDHDHdr
 		dw	0		; CDROM reserved
 		db	0		; CDROM drive letter
   Units 	db	0		; number of CD drives on this device
-
+ 
 rhAddr		dd	0
 SDAp		dd	0
-
-
+ 
+; --- XMS state (resident, global - single image) ---
+XMSEntry    dd  0
+XMSHandle   dw  0
+XMSMoveBlk:
+.xmLength   dd  0
+.xmSrcHandle    dw  0
+.xmSrcOfs   dd  0
+.xmDstHandle    dw  0
+.xmDstOfs   dd  0
+ 
 ; Use BP to access variables, since it's shorter than direct memory access
 ; (one byte for displacement, instead of two bytes for address).
 %define BP_(var) bp+var-CDHDHdr
-
-
+ 
 ; Make the IOCtl cases a little easier to read (NOT a general purpose case).
 %macro Case 1.nolist
   %ifctx case
@@ -151,22 +202,20 @@ SDAp		dd	0
 	sub	cl, %1 - IOCtl_AudioTrackInfo
 	jne	.err
 %endmacro
-
-
+ 
 ;************************************************************************
 ;* Driver Strategy routine
 ;************************************************************************
-
+ 
 Strategy
 	; ES:BX contains request header pointer, save it.
 	ses	bx, cs:rhAddr
 	retf
-
-
+ 
 ;************************************************************************
 ;* Driver Interrupt routine
 ;************************************************************************
-
+ 
 Interrupt
 	pushf
 	savea	ds,es
@@ -176,16 +225,16 @@ Interrupt
 	save	eax
 %endif
 	cld
-
+ 
 	zero	bp ; = CDHDHdr
-
+ 
 	; process command
 	lds	bx, [cs:BP_(rhAddr)]	; make sure we have RH addr
 	mov	al, [bx+rh.Unit]
 	cmp	al, i(iUnits)
 iUnits ib
 	jae	.unk
-
+ 
 	mov	cx, DriveEntry_size	; CH = 0
 	mov	si, Drive
 	mul	cl			; AH = 0
@@ -198,26 +247,53 @@ iUnits ib
 	 mov	cl, [es:di]		; 1st byte of DTA is subcommand
 	 inc	di			; address of buffer
 
+	 ; subcmd 0xFD = export XMS info for VSBHDA direct-read (Option D)
+	 cmp	cl, 0FDh
+	 jne	.not_xms_export
+	 ; Return 8 bytes: XMSHandle(w), BinSectSize(w), XMSEntry(dd)
+	 mov	ax, [cs:XMSHandle]
+	 stosw
+	 mov	ax, [cs:si+DriveEntry.BinSectSize]
+	 stosw
+	 mov	eax, [cs:XMSEntry]
+	 stosd
+	 zero	ax
+	 jmp	.ddone
+.not_xms_export:
+
 	 jcxz	.RDHACmd
 
-	 sub	cl, IOCtl_ReadDriveBytes
+     dec    cl
+     jz .HeadLoc
+     
+     sub	cl, IOCtl_ReadDriveBytes - 1
 	 je	.stb			; no bytes read
-
+ 
 	 Case IOCtl_DevStatCmd
-.stw2:	  stosw 			; status is 0
-.stw:	  stosw
-	  jmp	.done
 
+	  mov	ax, DriveNormalReady
+.stw2:	  stosw 			; status low word
+	  zero	ax
+.stw:	  stosw				; status high word (always 0)
+	  jmp	.done
+ 
 	 Case IOCtl_ReturnSectorSize
 	  stosb 			; force cooked mode
 	  mov	ah, SectorSize >> 8	; low byte is 0
 	  jmp	.stw
+ 
+.HeadLoc:
+      ; Head Location: byte 1=addr mode (0=HSG), bytes 2-5=LBA (0)
+      zero  ax
+      stosb
+      stosd
+      jmp   .done
 
 .RDHACmd:
 	  stosw 			; CDHDHdr = 0
 	  mov	ax, cs
 	  jmp	.stw
-
+ 
 	 Case IOCtl_ReturnVolumeSize
 .mvw2:
 %ifdef i8086
@@ -227,46 +303,268 @@ iUnits ib
 	  cs movsd
 %endif
 	  jmp	.done
-
+ 
 	 Case IOCtl_MediaChangedCmd
 	  inc	ax ;MediaChanged_No
 .stb:	  stosb
 .done:	  zero	ax
 	  jmp	.ddone
-
+ 
 	 Case IOCtl_AudioDiskInfo
-	  stosw 			; first and last track numbers
+	  mov	al, [cs:si+DriveEntry.FirstTrack]
+	  stosb				; first track number
+	  mov	al, [cs:si+DriveEntry.LastTrack]
+	  stosb				; last track number
 	  lodsw 			; skip over volume size
 	  lodsw
 	  jmp	.mvw2			; copy lead-out track
-
+ 
 	 Case IOCtl_AudioTrackInfo
+%ifndef i8086
+	  cmp	byte [cs:si+DriveEntry.ImageType], 1
+	  jne	.trk_iso
+ 
+	  ; CDM: look up track in track table
+	  mov	al, [es:di]		; requested track number
+	  push	es
+	  push	di			; save output buffer ptr
+	  call	GetTrackByNum		; CS:DI -> TrackEntry (clobbers AX,DI)
+	  jc	.trk_notfound
+	  ; Return standard 7-byte MSCDEX AudioTrackInfo response:
+	  ;   byte 0: track number
+	  ;   bytes 1-4: start address (Red Book: frame, sec, min, 0)
+	  ;   byte 5: track control info
+	  mov	cl, [cs:di+TrackEntry.Type]	; CL = 0=data, 1=audio
+	  mov	al, [cs:di+TrackEntry.TrackNum]
+	  mov	edx, [cs:di+TrackEntry.StartRedBook]
+	  pop	di			; restore output buffer DI
+	  pop	es			; restore output buffer ES
+	  stosb				; track number
+	  mov	eax, edx
+	  stosd				; Red Book address (frame, sec, min, 0)
+	  ; control: data=0x60 (data track + digital copy), audio=0x00
+	  test	cl, cl			; Type == 0 (data)?
+	  mov	al, 01100000b		; assume data
+	  je	.stb			; yes -> store and done
+	  zero	al			; no -> audio
+	  jmp	.stb
+.trk_notfound:
+	  pop	di
+	  pop	es
+.trk_iso:
+%endif
 	  stosb 			; force track 0
 	  mov	ah, 2
 	  stosw 			; track starts at 00:02:00
 	  stosw
 	  mov	al, 01100000b		; data track, digital copy permitted
 	  jmp	.stb
+ 
+     Case IOCtl_AudioQChannelInfo
+      ; Return synthetic Q-Channel: "audio playing"
+      ; Byte 1: Control/ADR = 01h (audio track, Q-subchannel position)
+      ; Byte 2: Track (BCD) = 02 (track 2, first audio track)
+      ; Byte 3: Index = 01
+      mov   al, 01h
+      stosb
+      mov   al, 02h
+      stosb
+      mov   al, 01h
+      stosb
+      ; Bytes 4-7: running time on track (min=0, sec=5, frame=0, zero=0)
+      zero  ax
+      stosw
+      stosw
+      ; Bytes 8-10: absolute time on disk (min=0, sec=7, frame=0)
+      zero  ax
+      stosw
+      stosb
+      jmp   .done
 
-	 ECase IOCtl_AudioStatusInfo
+     ECase IOCtl_AudioStatusInfo
 	  stosw 			; not paused
 	  stosw 			; starting location
 	  stosw
-	  jmp	.stw2			; ending location
+	  stosw				; ending location
+	  stosw
+	  jmp	.done
+ 
 
 .unk:	 mov	al, DE_UnknownUnit
-	 db	0b9h			; MOV CX, nnnn
-.err:	 mov	al, DE_UnknownCommand
+	 jmp	.erxit
+
+.err:
+	 mov	al, DE_UnknownCommand
 	 jmp	.erxit
 	fi
 
-	sub	al, rhcmdOpen - rhcmdIOCTL_In
+    cmp al, 0Ch - rhcmdIOCTL_In
+    je  .ddone_zero      ; IOCTL Output (Audio Channel Control etc.) -> no-op success
+    sub	al, rhcmdOpen - rhcmdIOCTL_In
 	je	.ddone
 	dec	ax ;rhcmdClose
 	je	.ddone
 
+    cmp al, 82h - rhcmdClose
+    je  .ddone_zero
+    cmp al, 83h - rhcmdClose
+    je  .ddone_zero
+ 
 	cmp	al, rhcmdReadLong - rhcmdClose
-	jne	.err
+	jne	.cmd_err
+
+	; Reentrancy guard: reject if already handling a ReadLong
+	cmp	byte [cs:.rl_busy], 0
+	jne	.rl_reenter
+	mov	byte [cs:.rl_busy], 1
+
+%ifndef i8086
+	cmp	byte [cs:si+DriveEntry.ImageType], 1
+	jne	.readlong_iso
+ 
+	; === CDM ReadLong path ===
+	; Check ReadMode: 0=cooked (data), 1=raw (audio)
+	cmp	byte [bx+rhTransfer.ReadMode], 1
+	je	.cdm_raw
+ 
+	; === CDM cooked read path ===
+	; Each raw sector is BinSectSize bytes; we extract SectorSize (2048) bytes
+	; of user data at DataOffset within each raw sector.
+	; Bounds check: StartSector must be within data track range
+	mov	eax, [bx+rhTransfer.StartSector]
+	cmp	eax, [cs:si+DriveEntry.DataStartLBA]
+	jb	.cdm_secerr
+	cmp	eax, [cs:si+DriveEntry.DataEndLBA]
+	jae	.cdm_secerr
+ 
+	; Clamp SectorCount so it doesn't extend past DataEndLBA
+	mov	ax, [bx+rhTransfer.SectorCount]
+	if ax ,a, 31
+	 mov	ax, 31
+	 mov	[bx+rhTransfer.SectorCount], ax
+	fi
+	test	ax, ax
+	jz	.ddone
+	; Ensure StartSector + SectorCount <= DataEndLBA
+	movzx	ecx, ax			; ECX = sector count
+	mov	eax, [bx+rhTransfer.StartSector]
+	add	ecx, eax		; ECX = StartSector + SectorCount
+	cmp	ecx, [cs:si+DriveEntry.DataEndLBA]
+	jbe	.cdm_count_ok
+	 ; Clamp: SectorCount = DataEndLBA - StartSector
+	 mov	ecx, [cs:si+DriveEntry.DataEndLBA]
+	 sub	ecx, eax
+	 mov	[bx+rhTransfer.SectorCount], cx
+
+.cdm_count_ok:
+	mov	ax, [bx+rhTransfer.SectorCount]
+	mov	[cs:.cdm_remain], ax
+	mov	eax, [bx+rhTransfer.StartSector]
+	mov	[cs:.cdm_lba], eax
+	; Cache DtaPtr locally — immune to timer overwriting rh_rl
+	mov	ax, [bx+rhTransfer.DtaPtr]
+	mov	[cs:.cdm_dta_off], ax
+	mov	ax, [bx+rhTransfer.DtaPtr+2]
+	mov	[cs:.cdm_dta_seg], ax
+.cdm_loop:
+	 ; Compute offset: file_offset = LBA * BinSectSize + DataOffset
+	 mov	eax, [cs:.cdm_lba]
+	 movzx	edx, word [cs:si+DriveEntry.BinSectSize]
+	 imul	eax, edx
+	 movzx	edx, word [cs:si+DriveEntry.DataOffset]
+	 add	eax, edx
+	 ; EAX = byte offset, ECX = 2048, ES:DI = cached DTA
+	 mov	ecx, SectorSize
+	 mov	di, [cs:.cdm_dta_off]
+	 mov	es, [cs:.cdm_dta_seg]
+	 call	XmsRead
+	 test	ax, ax
+	 jnz	.cdm_xms_err
+	 ; Advance cached DTA pointer by 2048
+	 add	word [cs:.cdm_dta_off], SectorSize
+	 ; Advance LBA
+	 inc	dword [cs:.cdm_lba]
+	 dec	word [cs:.cdm_remain]
+	 jnz	.cdm_loop
+	 ; All sectors read successfully
+	 zero	ax
+	jmp	.ddone
+
+.cdm_xms_err:
+	zerow	[bx+rhTransfer.SectorCount]
+	mov	al, DE_ReadError
+	jmp	.erxit
+.cdm_lba	dd	0
+.cdm_remain	dw	0
+.cdm_dta_off	dw	0		; cached DtaPtr offset (immune to rh_rl corruption)
+.cdm_dta_seg	dw	0		; cached DtaPtr segment
+ 
+.rl_busy	db	0
+ 
+
+.rl_reenter:
+	; Reentrant call — return error WITHOUT clearing .rl_busy
+	; (original call is still in progress)
+	zerow	[bx+rhTransfer.SectorCount]
+	mov	ax, DE_DeviceNotReady | DeviceError | DeviceDone
+	mov	[bx+rh.Status], ax
+	jmp	.rl_ret
+ 
+.cdm_secerr:
+	zerow	[bx+rhTransfer.SectorCount]
+	mov	al, DE_SectorNotFound
+	jmp	.erxit
+ 
+.cdm_raw:
+	; === CDM raw read path (ReadMode=1, 2352-byte sectors) ===
+	; Bounds check: StartSector must be < VolSize
+	mov	eax, [bx+rhTransfer.StartSector]
+	cmp	eax, [cs:si+DriveEntry.VolSize]
+	jae	.cdm_secerr
+ 
+	; Limit and clamp
+	mov	ax, [bx+rhTransfer.SectorCount]
+	if ax ,a, 31
+	 mov	ax, 31
+	 mov	[bx+rhTransfer.SectorCount], ax
+	fi
+	test	ax, ax
+	jz	.ddone
+	; Clamp so StartSector + SectorCount <= VolSize
+	movzx	ecx, ax
+	mov	eax, [bx+rhTransfer.StartSector]
+	add	ecx, eax
+	cmp	ecx, [cs:si+DriveEntry.VolSize]
+	jbe	.cdm_raw_ok
+	 mov	ecx, [cs:si+DriveEntry.VolSize]
+	 sub	ecx, eax
+	 mov	[bx+rhTransfer.SectorCount], cx
+
+.cdm_raw_ok:
+	; Single XmsRead for entire raw transfer — no per-sector loop.
+	; This eliminates the sti window where timer could corrupt rh_rl.
+	; Compute byte offset: EAX = StartSector * BinSectSize
+	mov	eax, [bx+rhTransfer.StartSector]
+	movzx	edx, word [cs:si+DriveEntry.BinSectSize]
+	imul	eax, edx		; EAX = byte offset in BIN image
+	; Compute total bytes: ECX = SectorCount * BinSectSize
+	movzx	ecx, word [bx+rhTransfer.SectorCount]
+	imul	ecx, edx		; ECX = total bytes to read
+	; Cache DtaPtr ONCE (immune to timer overwriting rh_rl)
+	les	di, [bx+rhTransfer.DtaPtr]
+	; Single XMS read for entire transfer
+	call	XmsRead
+	test	ax, ax
+	jnz	.cdm_raw_xms_err
+	zero	ax
+	jmp	.ddone
+
+.cdm_raw_xms_err:
+	zerow	[bx+rhTransfer.SectorCount]
+	mov	al, DE_ReadError
+	jmp	.erxit
+.readlong_iso:
+%endif
 	; Limit read to 62Ki.
 	mov	ax, [bx+rhTransfer.SectorCount]
 	if ax ,a, 31
@@ -313,15 +611,98 @@ PSP iw
 .erxit:  mov	ah, DeviceError >> 8
 	fi
 
-.ddone: or	ax, DeviceDone
+.ddone_zero:
+    zero    ax
+.ddone: mov	byte [cs:.rl_busy], 0
+	or	ax, DeviceDone
 	mov	[bx+rh.Status], ax
 
+.rl_ret:
 	restore
 	restore
 	popf
 	retf
 
+.cmd_err:
+	 mov	al, DE_UnknownCommand
+	 jmp	.erxit
 
+;+
+; FUNCTION : GetTrackByNum
+;
+;	Find track entry by track number (O(1) direct index).
+;
+; Parameters:
+;	AL := track number
+;	CS:SI -> DriveEntry
+;
+; Returns:
+;	CS:DI -> TrackEntry (carry clear)
+;	Carry set if not found
+;
+; Destroys:
+;	AX, DI
+;-
+GetTrackByNum
+	sub	al, [cs:si+DriveEntry.FirstTrack]
+	jc	.notfound
+	cmp	al, [cs:si+DriveEntry.NumTracks]
+	jae	.notfound
+%ifdef i8086
+	mov	ah, TrackEntry_size
+	mul	ah
+	mov	di, ax
+%else
+	movzx	di, al
+	imul	di, TrackEntry_size
+%endif
+	add	di, [cs:si+DriveEntry.TrackTableOfs]
+	clc
+	ret
+.notfound:
+	stc
+	ret
+	
+	
+;+
+; FUNCTION : XmsRead
+;
+;   Read data from the XMS-loaded image (pure memory copy, no DOS).
+;   Safe to call from any context including hardware interrupts.
+;
+; Parameters:
+;   EAX := byte offset in the image
+;   ECX := bytes to read (must be even; e.g. 2048, 2352, or multi-sector)
+;   ES:DI := destination buffer
+;
+; Returns:
+;   AX := 0 on success, nonzero on failure
+;
+; Destroys:
+;   EAX, EDX
+;-
+XmsRead:
+    ; Set up XMS move structure
+    mov [cs:XMSMoveBlk.xmLength], ecx
+    mov dx, [cs:XMSHandle]
+    mov [cs:XMSMoveBlk.xmSrcHandle], dx
+    mov [cs:XMSMoveBlk.xmSrcOfs], eax
+    zerow   [cs:XMSMoveBlk.xmDstHandle]
+    mov [cs:XMSMoveBlk.xmDstOfs], di
+    mov [cs:XMSMoveBlk.xmDstOfs+2], es
+    ; Call XMS move
+    push    ds
+    push    si
+     push   cs
+     pop    ds
+     mov    si, XMSMoveBlk
+     mov    ah, 0Bh
+     call   far [cs:XMSEntry]
+    pop si
+    pop ds
+    dec ax
+    ret
+ 
 ;+
 ; FUNCTION : ReadImage
 ;
@@ -340,8 +721,8 @@ PSP iw
 ;
 ;-
 ReadImage
-	mov	bx, [cs:si+DriveEntry.Handle]	; replaced with CALL if DR-DOS
-
+	mov	bx, [cs:si+DriveEntry.BinHandle]	; replaced with CALL if DR-DOS
+ 
 	; get InDOS flag
 	lds	si, [cs:BP_(SDAp)]
 	cmp	[si+1], dl		; DL = 0 from low byte of file offset
@@ -355,7 +736,7 @@ SDASave1 iw
 	  call	.cpsda
 	 restore
 	fi
-
+ 
 	dos	4200h			; set file pointer position
 	; read CD sector(s)
 	mov	cx, i(BytesToRead)
@@ -368,7 +749,7 @@ BytesToRead iw
 	 add	ax, cx
 	 cmov	al ,z, DE_SectorNotFound, DE_ReadError
 	fi
-
+ 
 	popf
 	if nz
 	 ; restore the SDA
@@ -381,29 +762,33 @@ SDASize iw
 	 rep	movsw
 	fi
 	ret
-
-
+ 
 Drive	; overwites the help screen
-
+ 
 ;SDASave
-
-
+ 
 ;============================================================================
 ;  everything below this line is discarded after installing the driver
-
+ 
 CopyrightMsg
-dln "SHSUCDHD by Jason Hood <jadoxa@yahoo.com.au>. | Derived from v2.0 by"
-dln "Version 3.01 (17 May, 2005). Freeware.        | John H. McCoy, May 1996,"
-dln "http://shsucdx.adoxa.vze.com/                 | Sam Houston State University."
-
+dln "+-----------------------------------------------------------------------------+"
+dln "| SHSUCDHD v4.00 by Shirish (IonfraX). Now supports Red Book audio! Based on: |"
+dln "+-----------------------------------------------------------------------------+"
+dln "| SHSUCDHD by Jason Hood <jadoxa@yahoo.com.au> | Derived from v2.0 by         |"
+dln "| Version 3.01 (17 May, 2005). Freeware.       | John H. McCoy, May 1996,     |"
+dln "| http://shsucdx.adoxa.vze.com/                | Sam Houston State University |"
+dln "+-----------------------------------------------------------------------------+"
 CRLF dlz
-
+ 
 HelpMsg
-dln "Simulate a CD-ROM using an image file."
+dln "Simulate a CD-ROM using an image file. Directly reads .ISO images from"
+dln "disk. Loads Red Book images from disk to XMS."
 dln
 dln "SHSUCDHD /F:[?]imagefilename... [/V] [/U] [/Q[Q]]"
 dln
-dln "   imagefilename  Standard .ISO file (generated by OMI, mkisofs, etc)."
+dln "   imagefilename  Standard .ISO file (generated by OMI, mkisofs, etc), OR"
+dln "                  .CDM CD metadata file for Red Book CD images (generated"
+dln "                  using MKCDM utility)"
 dln "                     '?' will ignore an invalid image."
 dln "   /V             Display memory usage (only at install)."
 dln "   /U             Unload."
@@ -411,25 +796,34 @@ dln "   /Q             Quiet - don't display sign-on banner."
 dln "   /QQ            Really quiet - don't display anything."
 dln
 dlz "The name of the device driver is SHSU-CDH."
-
+ 
 %define ln 13,10
 %define ht 9
-
+ 
 %ifndef i8086
 WrongCPUMsg		dlz "Must have at least a 386."
 %endif
 WrongDOSMsg		dlz "Must be DOS 3.3 or later."
-
+ 
 InstallMsg		dlz ln,"SHSU-CDH CD image driver installed."
 UnInstallMsg		dlz ln,"SHSUCDHD uninstalled and memory freed."
 CouldNotRemoveMsg	dlz ln,"SHSUCDHD can't uninstall."
 NotInstalledMsg 	dlz ln,"SHSUCDHD not installed."
 FileNotFoundMsg 	dlz ht,": failed to open"
 InvalidImageFileMsg	dlz ht,": unrecognized image"
+ 
+NoXMSMsg            dlz ln,"XMS driver required (HIMEM/JEMMEX)."
+XMSAllocFailMsg     dlz ln,"XMS allocation failed."
+XMSLoadFailMsg      dlz ln,"XMS image load failed."
+XMSLoadedMsg        dlz ln," done.",13,10,0
+XMSHandleMsg        db  ln,"XMS handle: "
+ProgressMsg         db  13,"Loading image: "
+ProgressPct         db  "  0%",0
+XMSHandleHex        db  "0000",0
 UnitMsg 		db  ht,": Unit /" ; assume no more than 10 units
 WarningPos		equ $-UnitMsg
 			dlz " (warning: file size differs from volume size)"
-
+ 
 MemoryUsage		dln
 			dz  "Memory Usage"
 MemoryHigh		dlz		" (loaded high)"
@@ -441,24 +835,25 @@ MemoryDynamic		dln	       "0000 bytes"
 MemorySDA		dln	       "0000 bytes"
 			db  "  Total:   "
 MemoryTotal		dlz	       "0000 bytes"
-
-
+ 
 ArgumentNotFound        EQU     2       ; Unrecognized argument
 NoArgumentsFound        EQU     1       ; No argument in command line
 ArgumentFound           EQU     0       ; Ok argument in command line
-
+ 
 section .bss align=1
 FName			resb	128
 buf			resb	92
-
+XferBuf         resb    32768
+TotalSize       resd    1
+ 
 section .text
 DOffset 		dw	Drive
-
+SavedPSP		dw	0
+ 
 Quiet			dflg	off
 Silent			dflg	off
 Ignore			dflg	off
-
-
+ 
 %ifdef DOSMOVES
 ; DR-DOS moves the DOS segment between CONFIG and AUTOEXEC, so SHSUCDHD will
 ; not work if it's INSTALLed. Fortunately, Int31 points to it (v7.01.07).
@@ -473,11 +868,10 @@ SetDOSseg
 %endif
 	mov	bx, [31h*4+2]
 	mov	[cs:BP_(SDAp+2)], bx
-	mov	bx, [cs:si+DriveEntry.Handle]
+	mov	bx, [cs:si+DriveEntry.BinHandle]
 	ret
 SetDOSseg_size equ $-SetDOSseg
-
-
+ 
 ;+
 ; FUNCTION : InitDOSseg
 ;
@@ -513,8 +907,7 @@ InitDOSseg
 	mov	[DOffset], di
 	return
 %endif
-
-
+ 
 ;+
 ; FUNCTION : MsgOut
 ;
@@ -538,21 +931,19 @@ MsgOut
 	 lodsb
 	is al nzr
 	return
-
+ 
 %macro Output 0-1.nolist
   %if %0 == 1
 	mov	si, %1
   %endif
 	call	MsgOut
 %endmacro
-
-
+ 
 Dont:	mov	si, NotInstalledMsg
 Xit:	Output
 	exit	1
 RC	equ	$-4
-
-
+ 
 ;+
 ; FUNCTION : Entry point
 ;-
@@ -560,7 +951,7 @@ RC	equ	$-4
 	ld	ds, cs
 	mov	[PSP], es
 	cld
-
+ 
 %ifndef i8086
 	; check processor. Based on code by Henrik Haftmann.
 	cpu	8086
@@ -578,12 +969,12 @@ RC	equ	$-4
 	jif	ax ,&!, 7000h, Xit
 	cpu	386
 %endif
-
+ 
 	; get DOS version
 	mov	si, WrongDOSMsg
 	dos	30h
 	jif	{al ,b, 3} OR e AND {ah ,b, 10}, Xit
-
+ 
 	mov	al, 'Q'                 ; /Q quiet
 	call	GetParm
 	if al ,e, ArgumentFound
@@ -592,14 +983,14 @@ RC	equ	$-4
 	 cbit	al, 5
 	 if. {al ,e, 'Q'}, sflg. [Silent]
 	fi
-
+ 
 	mov	al, 'U'                 ; /U uninstall driver
 	call	GetParm
 	jif	al ,e, ArgumentFound, UnInstallCDHD
-
+ 
 	ifnflg	[Quiet], \
 	 Output CopyrightMsg
-
+ 
 	mov	al, '?'                 ; /? help
 	call	GetParm
 	if al ,e, {ArgumentFound, NoArgumentsFound}
@@ -607,7 +998,19 @@ RC	equ	$-4
 	 mov	[RC], ch		; CH zero from command line length
 	 jmp	Xit
 	fi
-
+ 
+    ; Detect XMS driver
+    mov ax, 4300h
+    int 2Fh
+    cmp al, 80h
+    mov si, NoXMSMsg
+    jne Xit
+    mov ax, 4310h
+    int 2Fh
+    mov [XMSEntry], bx
+    mov [XMSEntry+2], es
+    mov es, [PSP]
+ 
 	mov	di, 80h 		; command line length at PSP +80h
 	movzx.	cx, [es:di]
 	while
@@ -616,25 +1019,347 @@ RC	equ	$-4
 	is al ,e, ArgumentFound
 	 call	MoveName
 	 save	es,di,cx
-
+ 
 	 ; canonicalize and display filename
 	 mov	si, FName
 	 ld	es, ds
 	 mov	di, buf
 	 dos	60h
 	 Output di
-
+ 
 	 ; open the file, see if it's a valid image
 	 zero	bx
 	 mov	dx, FName
 	 dos	3dc0h		; read only, deny none, private
 	 mov	si, FileNotFoundMsg
 	 jc	.noimg
+%ifndef i8086
+	 ; read first 4 bytes to check for .cdm magic signature
+	 xchg	bx, ax			; BX = file handle
+	 mov	dx, buf
+	 mov	cx, 4
+	 dos	3fh			; read 4 bytes
+	 jc	.not_cdm
+	 cmp	ax, 4
+	 jne	.not_cdm
+	 cmp	dword [buf], 'RDBK'
+	 jne	.not_cdm
+	 ; .cdm image detected — read remaining 28 bytes of header
+	 mov	dx, buf
+	 mov	cx, 28
+	 dos	3fh			; read bytes 4-31
+	 jc	.cdm_fail
+	 cmp	ax, 28
+	 jne	.cdm_fail
+ 
+	 ; populate DriveEntry from .cdm header
+	 ; buf layout (after magic): [0]num_tracks(w) [2]first_track(w)
+	 ;   [4]last_track(w) [6]bin_sector_size(w) [8]lead_out_lba(d)
+	 ;   [12]lead_out_redbook(d) [16]data_start_lba(d) [20]data_end_lba(d)
+	 ;   [24]data_offset(w) [26]bin_name_len(w)
+	 mov	si, [DOffset]
+	 mov	[si+DriveEntry.BinHandle], bx	; store .cdm handle for now
+	 mov	eax, [buf+8]			; lead_out_lba = VolSize
+	 mov	[si+DriveEntry.VolSize], eax
+	 mov	eax, [buf+12]			; lead_out_redbook
+	 mov	[si+DriveEntry.LeadOut], eax
+	 mov	al, [buf]			; num_tracks (low byte of word)
+	 mov	[si+DriveEntry.NumTracks], al
+	 mov	al, [buf+2]			; first_track
+	 mov	[si+DriveEntry.FirstTrack], al
+	 mov	al, [buf+4]			; last_track
+	 mov	[si+DriveEntry.LastTrack], al
+	 mov	byte [si+DriveEntry.ImageType], 1  ; BIN/CUE
+	 mov	ax, [buf+6]			; bin_sector_size
+	 mov	[si+DriveEntry.BinSectSize], ax
+	 mov	eax, [buf+16]			; data_start_lba
+	 mov	[si+DriveEntry.DataStartLBA], eax
+	 mov	eax, [buf+20]			; data_end_lba
+	 mov	[si+DriveEntry.DataEndLBA], eax
+	 mov	ax, [buf+24]			; data_offset
+	 mov	[si+DriveEntry.DataOffset], ax
+ 
+	 ; Load track table from .cdm into resident memory
+	 ; Track table destination: right after this DriveEntry
+	 mov	di, si
+	 add	di, DriveEntry_size		; DI = track table address
+	 mov	[si+DriveEntry.TrackTableOfs], di
+ 
+	 ; Seek to offset 32 in .cdm (start of track entries)
+	 zero	cx
+	 mov	dx, 32
+	 dos	4200h				; seek from start
+ 
+	 ; Read num_tracks * 20 bytes into memory at DS:DI
+	 movzx	cx, word [buf]			; num_tracks
+	 imul	cx, TrackEntry_size		; * 20
+	 push	cx				; save track table size
+	 mov	dx, di
+	 dos	3fh				; read track table
+	 pop	cx				; restore track table size
+	 jc	.cdm_fail
+	 cmp	ax, cx
+	 jne	.cdm_fail
+  
+	 ; Now open the BIN file referenced in the .cdm
+	 ; Seek past track table to BIN filename:
+	 ;   offset = 32 + num_tracks * 20
+	 push	si			; save DriveEntry pointer
+	 movzx	eax, word [buf]		; num_tracks
+	 imul	eax, TrackEntry_size	; * 20
+	 add	eax, 32			; + header size
+	 ldw	cx,dx, eax		; CX:DX = file offset
+	 dos	4200h			; seek from start
+ 
+	 ; Read BIN filename (bin_name_len + 1 for null terminator)
+	 movzx	cx, word [buf+26]	; bin_name_len
+	 inc	cx			; include null terminator
+ 
+	 ; Find directory part of FName: scan backward for '\'
+	 mov	di, FName
+.fslash: cmp	byte [di], 0
+	 je	.gotend
+	 inc	di
+	 jmp	.fslash
+.gotend: ; DI points to null terminator of FName
+.bscan:  cmp	di, FName
+	 je	.nodir			; no directory separator found
+	 dec	di
+	 cmp	byte [di], '\'
+	 jne	.bscan
+	 inc	di			; DI points past the '\' '
+	 jmp	.readbn
+.nodir:  mov	di, FName		; overwrite from start
+.readbn:
+	 ; Read BIN name directly into FName at DI
+	 mov	dx, di
+	 dos	3fh			; read BIN filename from .cdm
+	 jc	.cdm_binf1
+	 ; Close the .cdm file
+	 dos	3eh
+ 
+	 ; Open the BIN file
+	 mov	dx, FName
+	 dos	3dc0h			; read only, deny none, private
+	 jc	.cdm_binf2
+ 
+	 ; Store BIN handle in DriveEntry
+	 pop	si			; restore DriveEntry pointer
+	 mov	[si+DriveEntry.BinHandle], ax
+ 
+     ; Allocate XMS and load BIN image
+     mov    bx, ax          ; BX = BIN file handle
+     zero   cx
+     zero   dx
+     dos    4202h           ; seek to end -> DX:AX = file size
+     ; Save file size for loading loop
+     push   dx          ; high word of file size
+     push   ax          ; low word of file size
+
+     mov    edx, 786432     ; 768 MB in KB (hardcoded — dynamic calc GPFs with DOS4GW)
+     push   si          ; save DriveEntry pointer
+     mov    ah, 89h         ; XMS 3.0: alloc extended memory block
+     call   far [XMSEntry]
+     test   ax, ax
+     jnz    .xms_ok
+     mov    si, XMSAllocFailMsg
+     jmp    Xit         ; alloc filed -> refuse to install
+.xms_ok:
+     mov    [XMSHandle], dx
+     ; Print XMS handle for verification
+     mov    ax, dx
+     call   Hex4
+     Output XMSHandleMsg
+     pop    si          ; restore DriveEntry pointer
+     ; Seek back to start of BIN file
+     mov    bx, [si+DriveEntry.BinHandle]
+     zero   cx
+     zero   dx
+     dos    4200h
+ 
+     ; Use statuc 4KB buffer in BSS - no INT 21h/48h needed
+     ; Recover file size from stack (pushed as DX:AX = hi:lo)
+     pop    ax
+     pop    dx
+     ; DX:AX = file size in bytes - combine into ECX
+     shl    edx, 16
+     mov    dx, ax
+     mov    ecx, edx
+     mov    [TotalSize], ecx        ; save for progress calculation
+     ; Print initial progress (Output clobbers AX, DL, SI)
+     push   ecx
+     push   si
+     Output ProgressMsg
+     pop    si
+     pop    ecx
+     zero   edx             ; Initial XMS offset = 0 (MUST be after Output)
+     ; Load file into XMS in 32KB chunks (static buffer)
+.load_loop:
+     test   ecx, ecx
+     jz .load_done
+     ; Compute chunk size: min(32768, remaining)
+     cmp    ecx, 32768
+     jbe    .last_chunk
+     mov    eax, 32768
+     jmp    .do_chunk
+.last_chunk:
+     mov    eax, ecx
+.do_chunk:
+     push   ecx
+     push   edx
+     push   eax
+     ; DOS read: BX=handle, CX=count, DS:DX=XferBuf
+     mov    cx, ax
+     mov    dx, XferBuf
+     mov    bx, [si+DriveEntry.BinHandle]
+     dos    3fh
+     jc .load_err
+     cmp    ax, cx
+     jne    .load_err
+     ; XMS move: conv buffer -> XMS
+     pop    eax
+     pop    edx
+     ; XMS requires even length - round up
+     mov    ebx, eax
+     inc    ebx
+     and    bl, 0FEh
+     mov    [XMSMoveBlk.xmLength], ebx
+     zerow  [XMSMoveBlk.xmSrcHandle]
+     mov    word [XMSMoveBlk.xmSrcOfs], XferBuf
+     mov    [XMSMoveBlk.xmSrcOfs+2], ds
+     mov    cx, [XMSHandle]
+     mov    [XMSMoveBlk.xmDstHandle], cx
+     mov    [XMSMoveBlk.xmDstOfs], edx
+     push   eax
+     push   edx
+     push   si
+     push   ds
+     push   cs
+     pop    ds
+     mov    si, XMSMoveBlk
+     mov    ah, 0Bh
+     call   far [XMSEntry]
+     pop    ds
+     pop    si
+     pop    edx
+     test   ax, ax
+     pop    eax
+     jz .load_err
+     ; Advance: remaining -= chunk, offset += chunk
+     pop    ecx
+     add    edx, eax
+     sub    ecx, eax
+     ; Progress: compute percentage
+     push   eax
+     push   edx
+     push   ecx
+     push   bx
+     mov    eax, edx
+     shr    eax, 16          ; loaded >> 16 (fits 16 bits for up to 4GB)
+     mov    cx, 100
+     mul    cx              ; DX:AX = (loaded>>16)*100
+     mov    ebx, [TotalSize]
+     shr    ebx, 16          ; total >> 16
+     test   bx, bx
+     jz .skip_pct           ; avoid div by zero (tiny file)
+     div    bx              ; AX = percentage (0..100)
+     ; Format into ProgressPct: always 4 chars wide + NUL
+     mov    di, ProgressPct
+     cmp    ax, 100
+     jb .not100
+     mov    byte [di], '1'
+     mov    byte [di+1], '0'
+     mov    byte [di+2], '0'
+     mov    byte [di+3], '%'
+     jmp    .show_pct
+.not100:
+     ; AX = 0..99 - format as "  N%" or " NN%"
+     mov    cl, 10
+     zero   ah
+     div    cl              ; AL=tens, AH=ones
+     test   al, al
+     jz .single_digit
+     mov    byte [di], ' '
+     add    al, '0'
+     mov    [di+1], al
+     add    ah, '0'
+     mov    [di+2], ah
+     mov    byte [di+3], '%'
+     jmp    .show_pct
+.single_digit:
+     mov    byte [di], ' '
+     mov    byte [di+1], ' '
+     add    ah, '0'
+     mov    [di+2], ah
+     mov    byte [di+3], '%'
+.show_pct
+     push   si
+     Output ProgressMsg
+     pop    si
+.skip_pct:
+     pop    bx
+     pop    ecx
+     pop    edx
+     pop    eax
+     
+     jmp    .load_loop
+.load_err:
+     mov    si, XMSLoadFailMsg
+     jmp    Xit
+.load_done;
+     ; Close the BIN file - no longer needed
+     mov    bx, [si+DriveEntry.BinHandle]
+     dos    3eh
+     push   si
+     Output XMSLoadedMsg
+     pop    si
+ 
+	 ; Advance DOffset past DriveEntry + track table
+	 movzx	ax, word [buf]			; num_tracks
+	 imul	ax, TrackEntry_size		; * 20
+	 add	ax, DriveEntry_size		; + DriveEntry
+	 add	[DOffset], ax
+	 incb	[Units]
+	 incb	[iUnits]
+	 mov	si, UnitMsg
+	 incb	[si+WarningPos-1]
+	 ; no file size verify for .cdm — just show clean unit msg
+	 movw	[si+WarningPos], hl(10,13)
+	 mov	byte [si+WarningPos+2], 0
+	 zero	bx			; signal no error
+	 jmp	.showmsg
+.cdm_binf1:
+	 pop	si			; balance push si
+	 ; .cdm still open in BX — close it
+	 dos	3eh
+	 jmp	.cdm_errmsg
+.cdm_binf2:
+	 pop	si			; balance push si
+	 ; .cdm already closed, BIN open failed
+.cdm_errmsg:
+	 mov	si, InvalidImageFileMsg
+	 zero	bx
+	 jmp	.noimg
+.cdm_fail:
+	 dos	3eh			; close .cdm on header read failure
+	 mov	si, InvalidImageFileMsg
+	 zero	bx
+	 jmp	.noimg
+.not_cdm:
+	 ; rewind file to start for ISO check
+	 zero	cx
+	 zero	dx
+	 dos	4200h			; seek to 0
+%endif
 	 ; seek to sector 16 (PVD) and read the first few bytes
 	 zero	cx
 	 mov	dx, 16 * SectorSize
+%ifndef i8086
+	 dos	4200h			; seek from start
+%else
 	 xchg	bx, ax
 	 dos	4200h
+%endif
 	 mov	dx, buf
 	 mov	cx, 92
 	 dos	3fh
@@ -650,7 +1375,7 @@ RC	equ	$-4
 	  fi
 	 andif e
 	  mov	si, [DOffset]
-	  mov	[si+DriveEntry.Handle], bx
+	  mov	[si+DriveEntry.BinHandle], bx
 	  mmovd si+DriveEntry.VolSize, di
 	  call	vol2addr
 	  addw	[DOffset], DriveEntry_size
@@ -689,12 +1414,13 @@ RC	equ	$-4
 	  dos	3eh
 .noimg:   cmovby {!,[Ignore]}, [Units], -128
 	 fi
+.showmsg:
 	 Output
 	 restore
 	wend
-
+ 
 	jifb	[Units] ,le, 0, Dont
-
+ 
 	; get the SDA ptr
 	save	ds
 	 dos	5d06h
@@ -711,7 +1437,7 @@ RC	equ	$-4
 	mov	[SDASave2], ax
 	add	[DOffset], cx
 	add	[DOffset], cx
-
+ 
 	push	ax
 	 mov	al, 'V'                 ; /V display memory usage
 	 mov	es, [PSP]
@@ -719,24 +1445,30 @@ RC	equ	$-4
 	 if. {al ,e, ArgumentFound}, \
 	  call	DisplayMemory
 	pop	cx
-
+ 
+	; Save PSP segment before Link — Link's forward rep movsb may
+	; overwrite CS:PSP when the resident section exceeds 192 bytes
+	; (the distance between the copy destination and source).
+	mmovw	[SavedPSP], [PSP]
+ 
 	call	Link
 	Output	InstallMsg
-
-	mov	ds, [PSP]
+ 
+	mov	ds, [SavedPSP]
 	zero	ax
 	xchg	ax, [2Ch]		; find environment and release it
 	mov	es, ax
 	dos	49h
-
+ 
+	ld	ds, cs
+ 
 	mov	dx, [cs:DOffset]
 	add	dx, 4fh 		; first 40h bytes of PSP and rounding
 	mov	cl, 4
-	shr	dx, cl			; para to keep
-
+	shr	dx, cl
+ 
 	dos	3100h			; stay resident and exit
-
-
+ 
 ;+
 ; FUNCTION : Link
 ;
@@ -758,14 +1490,13 @@ Link
 	add	bx, 22h 		; ES:BX[22] is NUL device header
 	mmovd	NextDriver, es:bx	; put NUL.next in our header
 	sthl	di,si, es:bx		; then point NUL header at us
-
+ 
 	; relocate into the PSP
 	mov	es, di
 	zero	di
 	rep	movsb
 	ret
-
-
+ 
 ;+
 ; FUNCTION : vol2addr
 ;
@@ -797,8 +1528,28 @@ vol2addr
 	 xchg	ah, al
 	 mov	[si+DriveEntry.LeadOut], ax	; seconds & frames
 	 return
-
-
+ 
+;+
+; FUNCTION : Hex4
+;
+;   Convert AX to 4 hex ASCII digits in XMSHandleHex
+;-
+Hex4:
+    mov di, XMSHandleHex
+    mov cx, 4
+.lp:    rol ax, 4
+    push    ax
+    and al, 0Fh
+    add al, '0'
+    cmp al, '9'
+    jbe .ok
+    add al, 7
+.ok:    mov [di], al
+    inc di
+    pop ax
+    loop    .lp
+    ret    
+ 
 ;+
 ; FUNCTION : UnInstallCDHD
 ;
@@ -831,30 +1582,32 @@ UnInstallCDHD
 	 mov	ax, es
 	 les	di, [buf]		; previous header now in ES:DI
 	 mov	ds, ax			; ES:BX is addr of driver being removed
+ 
 	 mov	si, bx			; put it into DS:SI
 	 times 2 movsw			; move address DS:SI -> ES:DI
+	 mov	ax, ds
 	 sub	ax, 4			; locate the PSP of installed driver
 	 mov	ds, ax			;
 	pop	ax			; our PSP address (pushed ES above)
 	mov	[16h], ax		; make us parent of TSR
+ 
 	sthl	cs,.UnInstallExit, 10	; set TSR's terminate address
 	mov	bx, ds			; now make TSR's PSP the
 	dos	50h			; current PSP
 	sss	sp, cs:buf		; save stack info
 	exit				; terminate TSR and come back to next
-
+ 
 .UnInstallExit:
 	ld	ds, cs			; reestablish addressing
 	lss.	sp, buf 		; and stack info
 	mov	si, UnInstallMsg
 	zerob	[RC]
 	jmp	Xit
-
+ 
 .DriverNotFound:
 	mov	si, CouldNotRemoveMsg
 	jmp	Xit
-
-
+ 
 ;+
 ; FUNCTION : DisplayMemory
 ;
@@ -896,8 +1649,7 @@ DisplayMemory
 	call	itoa
 	Output	MemoryBytes
 	ret
-
-
+ 
 ;+
 ; FUNCTION : itoa
 ;
@@ -926,8 +1678,7 @@ itoa
 	 movb	[si], ' '
 	next
 	ret
-
-
+ 
 ;+
 ; FUNCTION : MoveName
 ;
@@ -961,8 +1712,7 @@ MoveName
 	dec	di
 	mov	[si], ch
 	ret
-
-
+ 
 ;+
 ; FUNCTION : FindParm
 ;
@@ -988,14 +1738,13 @@ FindParm
 	next
 	mov	al, ArgumentNotFound
 	return
-
+ 
 .FoundIt:
 	inc	di			; /X:name  make DI point @ name
 	dec	cx
 	mov	al, ArgumentFound
 	ret
-
-
+ 
 ;+
 ; FUNCTION : GetParm, GetNextParm
 ;
@@ -1022,12 +1771,12 @@ FindParm
 GetParm
 	mov	di, 80h 		; command line length PSP +80h
 	movzx.	cx, [es:di]
-
+ 
 GetNextParm
         mov     ah, NoArgumentsFound    ; assume no /X style arguments
 	retif	cxz
 	;if. {al ,[], 'a','z'}, cbit al, 5 ; Make character upper case
-
+ 
 	; Find start of argument
 	repeat
 	 inc	di
@@ -1045,9 +1794,9 @@ GetNextParm
 	next
 .ret:	mov	al, ah
         ret
-
-
+ 
 group dgroup text bss
-
+ 
 segment stack stack
 	resw	80
+    

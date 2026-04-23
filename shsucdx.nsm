@@ -1,4 +1,23 @@
+;****************************************************************************
+; SHSUCDX Version 4.00
+; Shirish (IonfraX / PCGamingTimeMachine), 2026
+; ionfrax@protonmail.com / ionfrax@gmail.com
 ;
+; To keep this section concise, I've detailed changes since
+; version 3.01 and what's special about this version, detailed
+; instructions in REDBOOK.TXT
+;
+; !!! DISCLAIMER !!!
+; AI help was used for bootstrap code for some functionalities,
+; debugging and code cleanup/formatting. However I did manually
+; verify everything and manually built on top of initial bootstrap
+; code blocks if AI was used. I severely despise AI slop but
+; acknowledge that used correctly it's a useful tool (especially
+; debugging).
+; If you find any issues or unoptimized code/logic in CD audio or
+; XMS related code, please let me know.
+;
+;*** Prev version comments:
 ;****************************************************************************
 ; SHSUCDX Version 3.00
 ; Jason Hood, September to November, 2004.
@@ -172,9 +191,13 @@ NoRedir 	equ	0ffh		; equate required for table terminator
 ; Credits
 		db	13		; overwrite JMP if TYPEd
 CopyrightMsg
-dln "SHSUCDX by Jason Hood <jadoxa@yahoo.com.au>. | Derived from v1.4b by"
-dln "Version 3.09 (2 September, 2022). Freeware.  | John H. McCoy, October 2000,"
-dlz "http://shsucdx.adoxa.vze.com/                | Sam Houston State University."
+dln "+-----------------------------------------------------------------------------+"
+dln "| SHSUCDX v4.00 by Shirish (IonfraX). Now supports Red Book audio! Based on:  |"
+dln "+-----------------------------------------------------------------------------+"
+dln "| SHSUCDX by Jason Hood <jadoxa@yahoo.com.au>.| Derived from v1.4b by         |"
+dln "| Version 3.09 (2 September, 2022). Freeware. | John H. McCoy, October 2000,  |"
+dlz "| http://shsucdx.adoxa.vze.com/               | Sam Houston State University. |"
+dlz "+-----------------------------------------------------------------------------+"
 		db	26
 
 ; Put the options here, to make room for the stack.
@@ -184,6 +207,7 @@ dlz "http://shsucdx.adoxa.vze.com/                | Sam Houston State University
 %endmacro
 
 Options dopt	'?', Opt?
+    dopt    'A', OptA
 	dopt	'C', OptC
 	dopt	'D', DoDriver
 	dopt	'E', OptIgn             ; MSCDEX: expanded memory
@@ -196,11 +220,14 @@ Options dopt	'?', Opt?
 	dopt	'S', OptIgn             ; MSCDEX: sharing
 	dopt	'U', OptU
 	dopt	'V', OptV
+    dopt    'Z', OptZ
 	dopt	'~', Opt~
 	dopt	255, OptUnk
 
 UnknownOpt		db  "Unknown option: '"
 OptChar 		dlz		     "?'."
+AInvalid        dlz "/A: expecting 0 or 1."
+ZInvalid        dlz "/Z: expecting drive letter (A-Z)."
 DInvalid		dlz "/D: invalid drive letter."
 DUnitNumber		dlz "/D: expecting unit number (0-99)."
 DMaxNumber		dlz "/D: expecting maximum units (1-9)."
@@ -336,6 +363,36 @@ IoCB_MediaChange db	9
 				; 1    not changed
 				; 0FFh media changed
 
+; CD Audio shared memory (read by VSBHDA ISR via flat address)
+CDAEnabled	db 0 ; /A:1 enables CD digital audio, 0=disabled (default)
+audio_mailbox:
+.flag       db 0 ; 0=idle, 1=command pending
+.command    db 0 ; 132=play, 133=stop, 136=resume
+.addrmode   db 0 ; 0=LBA, 1=Red Book
+.pad        db 0
+.start_raw  dd 0 ; starting address
+.num_sect   dd 0 ; number of sectors to play
+
+shared_slot:
+.pending    db 0 ; 0=idle, 1=read requested, 2=read complete
+.sectors    db 0 ; sectors to read (1-3)
+.drive      db 0 ; CD drive number for SetDDD
+.pad        db 0
+.lba        dd 0 ; starting LBA
+.buf_seg    dw 0 ; destination segment
+.buf_off    dw 0 ; destination offset
+
+; CD Audio timer data
+old_int1c   	dd 0 ; saved Int 1Ch vector
+Old_Int13h  	dd 0 ; saved orig INT 13h vector
+InDOS_ptr   	dd 0 ; far pointer to DOS InDOS flag
+cda_in_timer 	db 0 ; reentrancy guard
+DiskBusy    	db 0 ; 1 = INT 13h in progress
+caller_sp   	dw 0 ; saved caller SS:SP during stack switch
+caller_ss   	dw 0
+        align 2
+cda_stack  times 256 db 0  ; private stack for timer handler
+cda_stack_top:
 
 CD_Table	dw	CD_Number	; 00 Get number of CD-ROM drives
 		dw	CD_Device	; 01 Get CD-ROM drive device list
@@ -495,6 +552,13 @@ Main2F
 drdos:	cmp	ah, MSCDEX		; (replaced with CALL if using DR-DOS)
 	if e
 	 ; Handle the MSCDEX calls
+	 
+	 ; CD Audio discovery API: AX=15FFh (only if /A:1)
+	 cmp    al, 0FFh
+     jne    .not_cda
+     cmp    byte [CDAEnabled], 1
+	 je CD_Discover
+.not_cda:
 	 jif	al ,a, 10h, CD_unsupported
 	 cbw
 	 add	al, al			; clears carry
@@ -1739,6 +1803,159 @@ do_api:
 	or	ax, [Tildes]		; 0 = get tilde usage (clears carry)
 	retAX
 
+;+
+; FUNCTION : CD_Discover
+;
+;   Discovery API.
+;
+; Parameters:
+; AX = 15FFh
+; BX = CDDAh (magic)
+;
+; Returns:
+;   AX = CDDAh (confirms modified SHSUCDX)
+;   ES:BX = audio_mailbox address
+;   DI = shared_slot offset
+;   CX = audio_mailbox size (12)
+;   DX = shared_slot size (12)
+;
+;-
+
+CD_Discover:
+	cmp bx, 0CDDAh
+	jne ChainExit       ; not for us, chain to next handler
+	mov word [_ES], cs
+	mov word [_BX], audio_mailbox
+	mov word [_DI], shared_slot
+	mov word [_CX], 12
+	mov word [_DX], 12
+	mov ax, 0CDDAh      ; SetAX saves this to _AX
+	clc
+	jmp SetAX
+	
+;+
+; FUNCTION : cda_timer_handler
+;
+;   Int 1Ch hook for CD audio background reads.
+;   Chains to the previous handler first, then checks if it's safe
+;   to do a background CD read (Active == 0, InDOS == 0, no reentrancy).
+;-
+Int13h_Wrapper:
+    mov byte [cs:DiskBusy], 1
+    pushf
+    call far [cs:Old_Int13h]
+    mov byte [cs:DiskBusy], 0
+    retf 2
+cda_timer_handler:
+	pushf
+	call far [cs:old_int1c]  ; chain first - system timer must run
+	
+	; Reentrancy guard
+	cmp byte [cs:cda_in_timer], 0
+	jne cda_timer_exit
+
+	; Check: is there a pending shared_slot request?
+	cmp byte [cs:shared_slot.pending], 1
+	jne cda_timer_exit
+
+	; Check: is SHSUCDX idle?
+	push ax
+	;cmp byte [cs:Active], 0
+	;jne .timer_done
+	mov al, [cs:Active]
+
+%ifdef CDIMAGE
+	cmp al, 1            ; CDIMAGE: 1 = not active
+%else
+	cmp al, 0            ; Normal: 0 = not active
+%endif
+	pop ax
+	jne cda_timer_exit
+
+	; Check: is DOS idle? (InDOS flag == 0)
+	push ds
+	push bx
+	lds bx, [cs:InDOS_ptr]
+	cmp byte [bx], 0
+	pop bx
+	pop ds
+	jne cda_timer_exit
+
+
+	; Check: is disk subsystem idle?
+    cmp byte [cs:DiskBusy], 0
+    jne cda_timer_exit
+
+    ; Mark timer as active (reentrancy guard)
+    mov byte [cs:cda_in_timer], 1
+
+	; Save all registers
+	push ax
+	push bx
+	push cx
+	push dx
+	push si
+	push di
+	push bp
+	push ds
+	push es
+
+	; Switch to private stack
+	cli
+	mov [cs:caller_sp], sp
+	mov [cs:caller_ss], ss
+	push cs
+	pop ss
+	mov sp, cda_stack_top
+	sti
+
+	push cs
+	pop ds    ; DS = SHSUCDX segment
+	mov bp, top_stack ; BP_ macros need this
+
+	; Perform the shared_slot
+	mov cl, [shared_slot.drive]
+	call SetDDD
+	jnz cda_bg_fail
+
+	movzx cx, byte [shared_slot.sectors]    ; reload count (CX was clobbered above)
+	mov eax, [shared_slot.lba]
+	mov es, [shared_slot.buf_seg]
+	mov bx, [shared_slot.buf_off]
+
+    ; CDReadLong - important if user is only using a physical CD drive
+    mov byte [rh_rl+rhReadLong.ReadMode], 1     ; raw audio mode
+    call    CdReadLong
+    mov byte [rh_rl+rhReadLong.ReadMode], 0     ; restore for data reads
+    jnz cda_bg_fail
+	
+	mov byte [shared_slot.pending], 2    ; success - data ready
+    jmp short cda_bg_cleanup
+
+cda_bg_fail:
+	mov byte [shared_slot.pending], 3	 ; failed - signal error to VSBHDA
+
+cda_bg_cleanup:
+	; Restore caller's stack
+	cli
+	mov ss, [cs:caller_ss]
+	mov sp, [cs:caller_sp]
+	sti
+
+	pop es
+	pop ds
+	pop bp
+	pop di
+	pop si
+	pop dx
+	pop cx
+	pop bx
+	pop ax
+	
+	mov byte [cs:cda_in_timer], 0
+
+cda_timer_exit:
+	iret
 
 ; 10h:	Device request
 ;  In:	   CX  = CD-ROM drive letter (0 = A, 1 = B, etc)
@@ -1752,7 +1969,23 @@ CD_Request
 	push	ax
 	 call	SetDDD
 	 jnz	Err0F
+	 ;(placeholder) if necessary later, add code (similar to original path: section below)
+	 ; to re-read on next non-direct access if media has changed
 	pop	bx
+
+	; CD Audio: intercept audio commands
+    cmp byte [CDAEnabled], 1
+    jne .no_cda
+    mov al, [es:bx+rh.Command]
+	cmp al, 132
+	je  .audio_intercept
+	cmp al, 133
+	je  .audio_intercept
+	cmp al, 136
+	je  .audio_intercept
+
+.no_cda:
+	; Original path: pass through to device driver
 	call	DDCall
 	ifb [es:bx+rh.Command] ,e, rhcmdIOCTL_In
 	 les	bx, [es:bx+rhIOCTL.CBPtr]	; on some drives we
@@ -1766,6 +1999,32 @@ CD_Request
 	clc				; A-Ok from our perspective
 	ret
 
+.audio_intercept:
+	cmp al, 132
+	je .audio_write       ; Play always goes through (not 100% sure about this part)
+	cmp byte [audio_mailbox.flag], 1
+	je .audio_skip
+
+.audio_write:
+	; Write command into mailbox
+	mov [audio_mailbox.command], al
+	cmp al, 132
+	jne .audio_simple
+
+	; Play command: copy address mode + start + count
+    mov al, [es:bx+13]
+	mov [audio_mailbox.addrmode], al
+	mov eax, [es:bx+14]
+	mov [audio_mailbox.start_raw], eax
+	mov eax, [es:bx+18]
+	mov [audio_mailbox.num_sect], eax
+
+.audio_simple:
+	mov byte [audio_mailbox.flag], 1
+.audio_skip:
+	mov word [es:bx+rh.Status], 0100h ; DEV_DONE
+	clc
+	ret
 
 ;+
 ; FUNCTION : CDtoFCB
@@ -2592,10 +2851,10 @@ Drive	equ	$ + cdxsda_len * 2
 
 HelpMsg
 dln
-dln "Provides access to CD-ROM drives."
+dln "Provides access to CD-ROM drives (Red Book supported)."
 dln
 dln "SHSUCDX [/D:[?|*]DriverName[,[Drive][,[Unit][,[MaxDrives]]]] [/L:Drive]]"
-dln "        [/D:Drives] [/C] [/V] [/~[+|-]] [/R[+|-]] [/I] [/U] [/Q[+|Q]]"
+dln "        [/D:Drives] [/A] [/Z:CDADrv] [/C] [/V] [/~[+|-]] [/R[+|-]] [/I] [/U] [/Q[+|Q]]"
 dln "        [/L:Number] [/D] [/E][/K][/S][/M]"
 dln
 dln "   DriverName  Name of the CD-ROM device driver."
@@ -2622,6 +2881,8 @@ dln "                  0 = number of drives (255 = not installed)"
 dln "                  1 = first drive (1 = A:, 255 = not assigned)"
 dln "                  2 = second drive, etc."
 dln "   /D          Display assigned drives and return the number assigned."
+dln "   /A:1/0      Enable (1) or disable (0) CD digital audio."
+dln "   /Z:CDADrv   Drive letter for which to enable CD audio reads."
 dlz "   /E/K/S/M    Ignored (for MSCDEX commandline compatibility)."
 
 %define ln 13,10
@@ -2722,6 +2983,7 @@ LoadLow 	resb	1
 QuietFlag	resb	1
 XQuietFlag	resb	1
 VerboseFlag	resb	1
+CDADrive	resb    1       ; /Z: CD drive letter (for digital audio)
 BSS_size	equ	$-$$
 
 section .text
@@ -2855,6 +3117,8 @@ Begin:
 	zero	al
 	rep	stosb
 
+    mov byte [CDADrive], 0FFh  ; default = use first drive
+
 	mov	[ResSeg], cs
 
 	; is a redirector installed?
@@ -2980,7 +3244,7 @@ Begin:
 	jz	NoDrivesAssigned	; no drives were assigned or reserved
 
 	ifnflg	[IsInstalled]
-	 movzx. cx, al
+	 movzx cx, al
 	 mov	al, DrvEnt_size 	; find Drive Table space needed
 	 mul	cl
 	 add	ax, Drive
@@ -3059,6 +3323,23 @@ UnInstall:
 	 lds	dx, [es:Old2F]		; restore vector
 	 dos	252Fh
 	restore
+    
+    ; CD Audio: restore Int1Ch if it was hooked
+    cmp dword [es:old_int1c], 0
+    je .skip_13h_restore
+    save ds
+     lds    dx, [es:old_int1c]  ; restore Int 1Ch vector
+     dos    251Ch
+    restore
+
+    ; CD Audio: restore Int13h if it was hooked
+    cmp dword [es:Old_Int13h], 0
+    je  .skip_13h_restore
+    save    ds
+     lds    dx, [es:Old_Int13h]
+     dos    2513h
+    restore
+.skip_13h_restore:
 	mov	ax, es			; determine the MCB
 	add	ax, (Res_Begin - 40h) >> 4
 	mov	es, ax			; point back to the PSP
@@ -3763,6 +4044,45 @@ GetParm
 Opt?:	sflg.	[HelpMe]		; /? display help and exit
 	ret
 
+OptZ:   jif cxz, .noval         ; /A requires a drive letter
+    lodsb
+    cbit    al, 5
+    sub al, 'A'
+    cmp al, 26
+    jae .bad
+    mov [CDADrive], al
+    clc
+    ret
+.bad:   mov si, ZInvalid
+    stc
+    ret
+.noval:
+    clc
+    ret
+
+OptA:   jif cxz, .noval			; /A requres 0 or 1
+    lodsb
+    cmp al, '1'
+    je .enable
+    cmp al, '0'
+    je .disable
+    jmp short .bad
+.enable:
+    mov byte [CDAEnabled], 1
+    clc
+    ret
+.disable:
+    mov byte [CDAEnabled], 0
+    clc
+    ret
+.bad:   mov si, AInvalid
+    stc
+    ret
+.noval:
+    clc
+    ret
+
+
 OptI:	sflg.	[InstallIt]		; /I install anyway
 	cflg	[IsInstalled]
 	mov	[ResSeg], cs
@@ -4067,6 +4387,34 @@ Install:
 	dos	352Fh
 	ses	bx, Old2F
 
+    ; CD Audio: init only if /A:1
+    cmp byte [CDAEnabled], 1
+    jne .skip_cda_init
+	
+	; CD Audio: capture InDOS flag address
+	push es
+	mov ah, 34h
+	int 21h    ; ES:BX = far pointer to InDOS flag
+	ses bx, InDOS_ptr
+	pop es
+	
+	; CD Audio: save original Int 1Ch vector
+	push es
+	dos 351Ch  ; ES:BX = current Int 1Ch handler
+	ses bx, old_int1c
+	pop es
+
+	; CD Audio: pre-fill shared_slot.drive so VSBHDA doesn't need to query
+	;mmovb [shared_slot.drive], [Drive+DrvEnt.No]
+    ; CD Audio: pre-fill shared_slot.drive - use /A value if given, else first drive
+    mov al, [CDADrive]
+    cmp al, 0FFh
+    jne .cda_drive_set
+    mov al, [Drive+DrvEnt.No]
+.cda_drive_set
+    mov [shared_slot.drive], al
+.skip_cda_init:
+
 	; copy to the resident memory
 	mov	es, [ResSeg]
 	mov	di, CritInit		; no need to copy the stack
@@ -4082,6 +4430,26 @@ Install:
 	ld	ds, es
 	mov	dx, New2F
 	dos	252Fh
+
+	
+	; CD Audio: hook Int 1Ch and Int 13h (only if /A:1)
+    cmp byte [es:CDAEnabled], 1
+    jne .skip_cda_hook
+    ; Hook INT 13h for disk-busy tracking
+    ; DS already = resident segment from "ld ds, es" above
+    push    es
+    mov al, 13h
+    dos 35h
+    mov [ds:Old_Int13h], bx
+    mov [ds:Old_Int13h+2], es
+    pop es
+    mov dx, Int13h_Wrapper
+    mov al, 13h
+    dos 25h
+    ; Hook INT 1Ch for timer-based shared_slot
+	mov dx, cda_timer_handler
+	dos 251Ch
+.skip_cda_hook:
 
 	retf				; jump to critical init and exit
 
