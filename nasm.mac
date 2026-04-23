@@ -696,7 +696,9 @@ ssuffix_ rptlmt, while, whilst, is, break, cntnu, next, until
 	lss	%1, [%2]
 %endmacro
 
-%idefine movzx. movzx
+%imacro movzx. 2.nolist
+    movzx %1, byte %2
+%endmacro
 
 ; Store EAX to memory, after optionally loading from memory.
 %imacro mmovd 1-2.nolist
