@@ -226,7 +226,7 @@ Options dopt	'?', Opt?
 
 UnknownOpt		db  "Unknown option: '"
 OptChar 		dlz		     "?'."
-AInvalid        dlz "/A: expecting 0 or 1."
+AInvalid        dlz "/A: expecting ON, OFF or AUTO."
 ZInvalid        dlz "/Z: expecting drive letter (A-Z)."
 DInvalid		dlz "/D: invalid drive letter."
 DUnitNumber		dlz "/D: expecting unit number (0-99)."
@@ -364,7 +364,9 @@ IoCB_MediaChange db	9
 				; 0FFh media changed
 
 ; CD Audio shared memory (read by VSBHDA ISR via flat address)
-CDAEnabled	db 0 ; /A:1 enables CD digital audio, 0=disabled (default)
+CDAEnabled	db 0 ; 1=CD digital audio installed (/A:ON or /A:AUTO)
+CDAMode 	db 0 ; 0=OFF (analog, the driver plays), 1=ON (digital), 2=AUTO
+CDAClient	db 0 ; 1=a digital audio player (VSBHDA) is registered
 audio_mailbox:
 .flag       db 0 ; 0=idle, 1=command pending
 .command    db 0 ; 132=play, 133=stop, 136=resume
@@ -553,7 +555,7 @@ drdos:	cmp	ah, MSCDEX		; (replaced with CALL if using DR-DOS)
 	if e
 	 ; Handle the MSCDEX calls
 	 
-	 ; CD Audio discovery API: AX=15FFh (only if /A:1)
+	 ; CD Audio API: AX=15FFh (only if /A:ON or /A:AUTO)
 	 cmp    al, 0FFh
      jne    .not_cda
      cmp    byte [CDAEnabled], 1
@@ -1813,17 +1815,51 @@ do_api:
 ; BX = CDDAh (magic)
 ;
 ; Returns:
-;   AX = CDDAh (confirms modified SHSUCDX)
-;   ES:BX = audio_mailbox address
-;   DI = shared_slot offset
-;   CX = audio_mailbox size (12)
-;   DX = shared_slot size (12)
+;   CX = 0: discover and register as the digital audio player
+;     AX = CDDAh (confirms modified SHSUCDX)
+;     ES:BX = audio_mailbox address
+;     DI = shared_slot offset
+;     CX = audio_mailbox size (12)
+;     DX = shared_slot size (12)
+;   CX = 1: status;  CX = 2: set mode DL (0=OFF, 1=ON, 2=AUTO);
+;   CX = 3: unregister the player
+;     AX = CDDAh, BL = mode, BH = 1 if a player is registered,
+;     CL = 1 if PLAY goes to the player (digital), 0 to the driver
 ;
 ;-
 
 CD_Discover:
 	cmp bx, 0CDDAh
 	jne ChainExit       ; not for us, chain to next handler
+	mov cx, [_CX]
+	jcxz .discover
+	cmp cx, 2
+	jne .not_set
+	mov dl, [_DX]
+	cmp dl, 2
+	ja .status
+	cmp byte [CDAClient], 1     ; a playing player must stop when
+	jne .set_mode               ; PLAY goes elsewhere now
+	mov byte [audio_mailbox.command], 133
+	mov byte [audio_mailbox.flag], 1
+.set_mode:
+	mov [CDAMode], dl
+	jmp short .status
+.not_set:
+	cmp cx, 3
+	jne .status
+	mov byte [CDAClient], 0
+.status:
+	mov bl, [CDAMode]
+	mov bh, [CDAClient]
+	mov [_BX], bx
+	call CDA_Digital
+	mov [_CX], ax
+	mov ax, 0CDDAh
+	clc
+	jmp SetAX
+.discover:
+	mov byte [CDAClient], 1
 	mov word [_ES], cs
 	mov word [_BX], audio_mailbox
 	mov word [_DI], shared_slot
@@ -1833,6 +1869,27 @@ CD_Discover:
 	clc
 	jmp SetAX
 	
+;+
+; FUNCTION : CDA_Digital
+;
+;   AX = 1 (NZ) when PLAY/STOP/RESUME go to the digital audio player:
+;   mode ON, or AUTO with a registered player.  Else AX = 0 (ZR) and the
+;   device driver plays (analog output of the drive).
+;-
+CDA_Digital:
+	xor ax, ax
+	cmp byte [CDAEnabled], 1
+	jne .done
+	cmp byte [CDAMode], 1
+	je .yes
+	cmp byte [CDAMode], 2
+	jne .done
+	cmp byte [CDAClient], 1
+	jne .done
+.yes:	inc ax
+.done:	test ax, ax
+	ret
+
 ;+
 ; FUNCTION : cda_timer_handler
 ;
@@ -1974,8 +2031,8 @@ CD_Request
 	pop	bx
 
 	; CD Audio: intercept audio commands
-    cmp byte [CDAEnabled], 1
-    jne .no_cda
+    call CDA_Digital
+    jz .no_cda
     mov al, [es:bx+rh.Command]
 	cmp al, 132
 	je  .audio_intercept
@@ -2854,7 +2911,7 @@ dln
 dln "Provides access to CD-ROM drives (Red Book supported)."
 dln
 dln "SHSUCDX [/D:[?|*]DriverName[,[Drive][,[Unit][,[MaxDrives]]]] [/L:Drive]]"
-dln "        [/D:Drives] [/A] [/Z:CDADrv] [/C] [/V] [/~[+|-]] [/R[+|-]] [/I] [/U] [/Q[+|Q]]"
+dln "        [/D:Drives] [/A:mode] [/Z:CDADrv] [/C] [/V] [/~[+|-]] [/R[+|-]] [/I] [/U] [/Q[+|Q]]"
 dln "        [/L:Number] [/D] [/E][/K][/S][/M]"
 dln
 dln "   DriverName  Name of the CD-ROM device driver."
@@ -2881,7 +2938,8 @@ dln "                  0 = number of drives (255 = not installed)"
 dln "                  1 = first drive (1 = A:, 255 = not assigned)"
 dln "                  2 = second drive, etc."
 dln "   /D          Display assigned drives and return the number assigned."
-dln "   /A:1/0      Enable (1) or disable (0) CD digital audio."
+dln "   /A:mode     CD audio: ON digital (VSBHDA), OFF analog (the drive),"
+dln "               AUTO digital while VSBHDA is loaded, else analog."
 dln "   /Z:CDADrv   Drive letter for which to enable CD audio reads."
 dlz "   /E/K/S/M    Ignored (for MSCDEX commandline compatibility)."
 
@@ -4060,18 +4118,38 @@ OptZ:   jif cxz, .noval         ; /A requires a drive letter
     clc
     ret
 
-OptA:   jif cxz, .noval			; /A requres 0 or 1
+OptA:   jif cxz, .noval			; /A requires ON, OFF, AUTO (1, 0)
     lodsb
     cmp al, '1'
     je .enable
     cmp al, '0'
     je .disable
+    cbit    al, 5
+    cmp al, 'A'
+    je .auto
+    cmp al, 'O'
+    jne .bad
+    dec cx
+    jz .bad
+    lodsb
+    cbit    al, 5
+    cmp al, 'N'
+    je .enable
+    cmp al, 'F'
+    je .disable
     jmp short .bad
 .enable:
+    mov al, 1
+    jmp short .set
+.auto:
+    mov al, 2
+.set:
+    mov byte [CDAMode], al
     mov byte [CDAEnabled], 1
     clc
     ret
 .disable:
+    mov byte [CDAMode], 0
     mov byte [CDAEnabled], 0
     clc
     ret
