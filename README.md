@@ -1,9 +1,9 @@
-# SHSUCD with digital CD audio (GeosOne)
+# SHSUCD with digital CD audio
 
-The SHSUCD suite of Jason Hood ([adoxa/shsucd](https://github.com/adoxa/shsucd), see [readme.txt](readme.txt)) with changes. This is an altered version, not the original:
+The SHSUCD suite of Jason Hood ([adoxa/shsucd](https://github.com/adoxa/shsucd), see [readme.txt](readme.txt)) with the CD audio support of PCGamingTimeMachine ([PCGamingTimeMachine/shsucd](https://github.com/PCGamingTimeMachine/shsucd)). This is an altered version, not the original.
 
-- **CD audio** (PCGamingTimeMachine): SHSUCDX 4.00 hands PLAY, STOP and RESUME to a digital player such as [VSBHDA](https://github.com/geosone/VSBHDA), which reads the audio sectors from the drive. Games then play their CD music on drives without an analog cable (SATA, USB, virtual). SHSUCDHD 4.00 plays the audio tracks of CUE/BIN images from XMS (`MKCDM` makes the track table).
-- **GeosOne:** `SHSUCDX /A:ON|OFF|AUTO` and `CDAUDIO.COM` to show or switch the mode at run time; a setup package.
+- **CD audio, by PCGamingTimeMachine** (SHSUCDX and SHSUCDHD 4.00): SHSUCDX hands PLAY, STOP and RESUME to a digital player such as [VSBHDA](https://github.com/geosone/VSBHDA), which reads the audio sectors from the drive. Games then play their CD music on drives without an analog cable (SATA, USB, virtual). SHSUCDHD plays the audio tracks of CUE/BIN images from XMS (`MKCDM` makes the track table).
+- **This fork (GeosOne)** only adds a setup package and a small change: `SHSUCDX /A:ON|OFF|AUTO` and `CDAUDIO.COM` to show or switch the mode at run time.
 
 | Mode | PLAY goes to |
 |---|---|
